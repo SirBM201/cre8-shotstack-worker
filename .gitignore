@@ -1,0 +1,4 @@
+# Firebase / Google credentials
+cre8-studio-firebase-key.json
+firebase-service-account.json
+*.pem

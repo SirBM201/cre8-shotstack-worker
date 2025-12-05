@@ -1,0 +1,3 @@
+shotstack-sdk
+python-dotenv
+requests
