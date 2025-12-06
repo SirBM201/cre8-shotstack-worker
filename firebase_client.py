@@ -1,127 +1,43 @@
+import json
 import os
-
-# Ensure Google credentials are set
-if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
-    raise Exception(
-        "Missing GOOGLE_APPLICATION_CREDENTIALS environment variable.\n"
-        "Run:\n"
-        "  setx GOOGLE_APPLICATION_CREDENTIALS \"C:\\Users\\sirbm\\Desktop\\cre8-shotstack-worker\\cre8-studio-firebase-key.json\""
-    )
-
-import os
-import datetime
-from typing import Dict, Any, List, Tuple
-
 from google.cloud import firestore
 from google.oauth2 import service_account
-from dotenv import load_dotenv
+from datetime import datetime, timezone
 
-# ---------------------------------------------------------
-# Load .env so we can read FIREBASE_PROJECT_ID and path
-# ---------------------------------------------------------
-load_dotenv()
+if "FIREBASE_SERVICE_ACCOUNT" not in os.environ:
+    raise Exception("Missing FIREBASE_SERVICE_ACCOUNT secret")
 
-# Path to your service account
-SERVICE_ACCOUNT_PATH = os.getenv(
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "./firebase-service-account.json",  # fallback – same as we used before
+# Load service account JSON from environment variable (as text)
+service_account_info = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT"])
+
+credentials = service_account.Credentials.from_service_account_info(
+    service_account_info
 )
 
-if not os.path.isfile(SERVICE_ACCOUNT_PATH):
-    raise RuntimeError(
-        f"Service account file not found at: {SERVICE_ACCOUNT_PATH}. "
-        "Make sure firebase-service-account.json is in this folder "
-        "or set GOOGLE_APPLICATION_CREDENTIALS in your .env."
-    )
-
-# Build credentials from JSON
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_PATH
+db = firestore.Client(
+    project=service_account_info["project_id"],
+    credentials=credentials
 )
 
-# Project ID – can come from env or from the JSON file
-PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
+JOBS_COLLECTION = os.getenv("FIREBASE_JOBS_COLLECTION", "jobs")
 
-# Firestore client using explicit credentials
-db = firestore.Client(project=PROJECT_ID, credentials=credentials)
+def create_job(data):
+    ref = db.collection(JOBS_COLLECTION).add(data)
+    return ref[1].id
 
+def update_job(job_id, data):
+    db.collection(JOBS_COLLECTION).document(job_id).update(data)
 
-# ============================================================
-# Create a new job
-# ============================================================
+def add_job_event(job_id, event):
+    event["created_at"] = datetime.now(timezone.utc)
+    db.collection(JOBS_COLLECTION).document(job_id)\
+        .collection("events").add(event)
 
-def create_job(data: Dict[str, Any]) -> str:
-    """
-    Insert a job document into 'jobs' collection.
-    Firestore auto-generates the ID.
-    Returns the newly-created job_id.
-    """
-    ref = db.collection("jobs").add(data)
-    job_id = ref[1].id
-    return job_id
-
-
-# ============================================================
-# Query for pending jobs
-# ============================================================
-
-def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    Returns: list of (job_id, job_data) for jobs with status='pending',
-    ordered by created_at.
-    """
-    jobs_ref = (
-        db.collection("jobs")
+def get_pending_jobs():
+    return (
+        db.collection(JOBS_COLLECTION)
         .where("status", "==", "pending")
         .order_by("created_at")
-        .limit(limit)
+        .limit(5)
         .stream()
-    )
-
-    result: List[Tuple[str, Dict[str, Any]]] = []
-    for doc in jobs_ref:
-        result.append((doc.id, doc.to_dict()))
-    return result
-
-
-# ============================================================
-# Update job fields (partial update)
-# ============================================================
-
-def update_job(job_id: str, fields: Dict[str, Any]) -> None:
-    """
-    Partially update a job document.
-    Example:
-        update_job("abc123", {"status": "processing"})
-    """
-    # Always update the timestamp as well
-    fields.setdefault(
-        "updated_at", datetime.datetime.now(datetime.timezone.utc)
-    )
-
-    (
-        db.collection("jobs")
-        .document(job_id)
-        .update(fields)
-    )
-
-
-# ============================================================
-# Add event to job sub-collection
-# ============================================================
-
-def add_event(job_id: str, event: Dict[str, Any]) -> None:
-    """
-    Append an event under jobs/{job_id}/events/.
-    Automatically adds created_at if missing.
-    """
-    event.setdefault(
-        "created_at", datetime.datetime.now(datetime.timezone.utc)
-    )
-
-    (
-        db.collection("jobs")
-        .document(job_id)
-        .collection("events")
-        .add(event)
     )
