@@ -1,3 +1,9 @@
-shotstack-sdk
+shotstack-sdk==0.2.8
+
+# Firebase / Firestore
+google-cloud-firestore
+google-auth
+
+# Helpers
 python-dotenv
 requests
