@@ -93,6 +93,29 @@ def update_job_status(
     LOG.info("Updating job %s with %s", job_id, update_data)
     doc_ref.update(update_data)
 
+def update_job(job_id: str, data: Dict[str, Any]) -> None:
+    """
+    Generic job updater used by main.py.
+
+    If 'status' is present in data, we use update_job_status so that
+    status changes are always logged with updated_at. Any other fields
+    in 'data' are merged into the document.
+    """
+    # If the caller wants to change status, use the standard helper
+    if "status" in data:
+        status = data.pop("status")
+        update_job_status(job_id, status, data)
+        return
+
+    # Otherwise just update arbitrary fields
+    doc_ref = db.collection(JOBS_COLLECTION).document(job_id)
+    update_data: Dict[str, Any] = {
+        **data,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    }
+
+    LOG.info("Updating job %s with fields %s", job_id, update_data)
+    doc_ref.update(update_data)
 
 def add_event(job_id: str, event: Dict[str, Any]) -> None:
     """
@@ -112,3 +135,4 @@ def add_event(job_id: str, event: Dict[str, Any]) -> None:
 
     LOG.info("Adding event for job %s: %s", job_id, event_data)
     events_ref.add(event_data)
+
