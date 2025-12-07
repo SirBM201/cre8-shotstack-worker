@@ -5,38 +5,63 @@ from typing import Any, Dict, List, Tuple
 
 from google.cloud import firestore
 
-# Simple logging setup
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Service account key handling
+# ---------------------------------------------------------------------------
+
+# Where we want the key JSON file inside the container
+FIREBASE_KEY_PATH = "/app/firebase-key.json"
+
+# This env var will contain the full JSON of your service account
+SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_KEY_JSON")
+
+if SERVICE_ACCOUNT_JSON:
+    try:
+        # Write the JSON to /app/firebase-key.json on startup
+        with open(FIREBASE_KEY_PATH, "w") as f:
+            f.write(SERVICE_ACCOUNT_JSON)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = FIREBASE_KEY_PATH
+        logger.info("✅ Wrote FIREBASE_KEY_JSON to %s", FIREBASE_KEY_PATH)
+    except Exception as e:
+        logger.exception("❌ Failed to write FIREBASE_KEY_JSON: %s", e)
+else:
+    logger.warning(
+        "⚠️ FIREBASE_KEY_JSON env var is not set; "
+        "Firestore will rely on default Google auth."
+    )
 
 # ---------------------------------------------------------------------------
 # Firestore setup
 # ---------------------------------------------------------------------------
 
-# Use env var for collection name if provided, otherwise "jobs"
+# Root collection for jobs (can be overridden from env)
 JOBS_COLLECTION = os.getenv("FIREBASE_JOBS_COLLECTION", "jobs")
 
-# Firestore client (uses GOOGLE_APPLICATION_CREDENTIALS)
+# Firestore client (uses GOOGLE_APPLICATION_CREDENTIALS we just set)
 db = firestore.Client()
 
-# Keep this global so any existing imports from main.py still work
+# Keep this name for compatibility with main.py
 jobs_collection = db.collection(JOBS_COLLECTION)
 logger.info("Firestore jobs collection set to: %s", JOBS_COLLECTION)
 
 # ---------------------------------------------------------------------------
-# Pending jobs
+# Fetch pending jobs
 # ---------------------------------------------------------------------------
 
 def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
     """
     Fetch pending, unclaimed jobs from Firestore.
 
-    To keep things simple (and avoid index issues), we:
-      - Stream ALL documents in the jobs collection
-      - Log each document's data
-      - Filter in Python for:
-            status == "pending"
-            claimed is missing or False
+    We stream all docs from the jobs collection and filter in Python for:
+      - status == "pending"
+      - claimed is missing or False
     """
     logger.info("🔍 Scanning Firestore collection '%s' for pending jobs...", JOBS_COLLECTION)
 
@@ -48,11 +73,11 @@ def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
     for doc in docs:
         data = doc.to_dict() or {}
 
-        # Log a trimmed JSON version so logs stay readable
         try:
             data_json = json.dumps(data, default=str)
         except TypeError:
             data_json = str(data)
+
         logger.info("   • Doc %s => %s", doc.id, data_json[:600])
 
         status = data.get("status")
@@ -71,7 +96,6 @@ def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
 
     logger.info("✅ Returning %d pending job(s)", len(pending))
     return pending[:limit]
-
 
 # ---------------------------------------------------------------------------
 # Job helpers used by the worker
