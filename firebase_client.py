@@ -9,7 +9,7 @@ from google.cloud import firestore
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Name of the jobs collection (default: "jobs")
+# Root collection name for jobs
 JOBS_COLLECTION = os.getenv("FIREBASE_JOBS_COLLECTION", "jobs")
 
 # Firestore client (uses GOOGLE_APPLICATION_CREDENTIALS)
@@ -22,34 +22,39 @@ def _jobs_collection():
 
 def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
     """
-    Fetch jobs that are:
-      - status == "pending"
-      - claimed is not True (either False or missing)
+    Super-safe version:
+    - Reads ALL docs from the jobs collection
+    - Filters in Python:
+        status == "pending"
+        claimed is not True (either False or missing)
+    - Returns at most `limit` jobs.
 
-    We fetch by status only, then filter claimed in Python.
-    This is simpler and avoids any index issues.
+    This bypasses any Firestore query/index issues and also logs what it sees.
     """
-    logger.info("Fetching pending jobs from Firestore (status=='pending')...")
+    logger.info("🔍 Scanning Firestore jobs collection for pending jobs...")
 
-    query = _jobs_collection().where("status", "==", "pending").limit(limit)
-    docs = list(query.stream())
-
-    logger.info("Fetched %d raw pending job(s) from Firestore", len(docs))
+    docs = list(_jobs_collection().stream())
+    logger.info("🔍 Found %d job document(s) in collection '%s'", len(docs), JOBS_COLLECTION)
 
     jobs: List[Tuple[str, Dict[str, Any]]] = []
 
     for doc in docs:
         data = doc.to_dict() or {}
+
+        # Debug: show what each doc looks like
+        logger.info("   • Doc %s => %s", doc.id, data)
+
+        status = data.get("status")
         claimed = data.get("claimed")
 
-        # Only process jobs that are not explicitly claimed True
-        if claimed is True:
-            logger.info("Skipping job %s because claimed == True", doc.id)
-            continue
+        if status == "pending" and claimed is not True:
+            logger.info("   ✅ Doc %s matches pending+unclaimed filter", doc.id)
+            jobs.append((doc.id, data))
 
-        jobs.append((doc.id, data))
+            if len(jobs) >= limit:
+                break
 
-    logger.info("Returning %d unclaimed pending job(s)", len(jobs))
+    logger.info("➡️ Returning %d pending job(s)", len(jobs))
     return jobs
 
 
@@ -58,7 +63,7 @@ def get_rendering_jobs(limit: int = 20) -> List[Tuple[str, Dict[str, Any]]]:
     Fetch jobs that are:
       - status == "rendering"
       - claimed == True
-      - have metadata.render_id (validated later)
+    This can stay as a normal Firestore query.
     """
     logger.info("Fetching rendering jobs from Firestore...")
 
@@ -77,7 +82,7 @@ def get_rendering_jobs(limit: int = 20) -> List[Tuple[str, Dict[str, Any]]]:
 def update_job(job_id: str, data: Dict[str, Any]) -> None:
     """
     Update a job document.
-    Supports nested fields via dot notation (e.g. "metadata.output_url").
+    Supports nested fields via dot notation (e.g. 'metadata.output_url').
     """
     logger.info("Firestore update_job(%s, %s)", job_id, data)
     _jobs_collection().document(job_id).update(data)
