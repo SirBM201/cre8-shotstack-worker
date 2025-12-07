@@ -24,20 +24,33 @@ def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
     """
     Fetch jobs that are:
       - status == "pending"
-      - claimed == False
+      - claimed is not True (either False or missing)
+
+    We fetch by status only, then filter claimed in Python.
+    This is simpler and avoids any index issues.
     """
-    logger.info("Fetching pending jobs from Firestore...")
+    logger.info("Fetching pending jobs from Firestore (status=='pending')...")
 
-    query = (
-        _jobs_collection()
-        .where("status", "==", "pending")
-        .where("claimed", "==", False)
-        .limit(limit)
-    )
-
+    query = _jobs_collection().where("status", "==", "pending").limit(limit)
     docs = list(query.stream())
-    logger.info("Fetched %d pending job(s) from Firestore", len(docs))
-    return [(doc.id, doc.to_dict()) for doc in docs]
+
+    logger.info("Fetched %d raw pending job(s) from Firestore", len(docs))
+
+    jobs: List[Tuple[str, Dict[str, Any]]] = []
+
+    for doc in docs:
+        data = doc.to_dict() or {}
+        claimed = data.get("claimed")
+
+        # Only process jobs that are not explicitly claimed True
+        if claimed is True:
+            logger.info("Skipping job %s because claimed == True", doc.id)
+            continue
+
+        jobs.append((doc.id, data))
+
+    logger.info("Returning %d unclaimed pending job(s)", len(jobs))
+    return jobs
 
 
 def get_rendering_jobs(limit: int = 20) -> List[Tuple[str, Dict[str, Any]]]:
@@ -45,7 +58,7 @@ def get_rendering_jobs(limit: int = 20) -> List[Tuple[str, Dict[str, Any]]]:
     Fetch jobs that are:
       - status == "rendering"
       - claimed == True
-      - have metadata.render_id
+      - have metadata.render_id (validated later)
     """
     logger.info("Fetching rendering jobs from Firestore...")
 
