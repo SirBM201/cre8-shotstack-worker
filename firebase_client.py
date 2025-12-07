@@ -1,8 +1,7 @@
-# firebase_client.py
+import json
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
 import os
+from typing import Any, Dict, List, Tuple
 
 from google.cloud import firestore
 
@@ -12,89 +11,87 @@ logger = logging.getLogger(__name__)
 JOBS_COLLECTION = os.getenv("FIREBASE_JOBS_COLLECTION", "jobs")
 logger.info("Firestore jobs collection set to: %s", JOBS_COLLECTION)
 
+# Firestore client (uses GOOGLE_APPLICATION_CREDENTIALS)
 db = firestore.Client()
 
 
 def _jobs_collection():
+    """Return the Firestore collection where jobs are stored."""
     return db.collection(JOBS_COLLECTION)
 
 
+# ---------------------------------------------------------------------------
+# Pending jobs
+# ---------------------------------------------------------------------------
 def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
     """
-    SUPER SAFE:
-    - Scan the whole jobs collection
-    - Filter in Python:
-        status == "pending"
-        claimed is not True (False or missing)
+    Fetch pending, unclaimed jobs from Firestore.
+
+    We deliberately:
+      - Scan ALL documents in the collection
+      - Log each document's data
+      - Filter in Python for:
+            status == "pending"
+            claimed is missing or False
+    so we don't rely on Firestore query indexes while debugging.
     """
-    logger.info("🔍 Scanning Firestore jobs collection for pending jobs...")
+    logger.info("🔍 Scanning Firestore jobs collection '%s' for pending jobs...", JOBS_COLLECTION)
 
     docs = list(_jobs_collection().stream())
-    logger.info("🔍 Found %d document(s) in '%s'", len(docs), JOBS_COLLECTION)
+    logger.info("🔍 Found %d document(s) total in '%s'", len(docs), JOBS_COLLECTION)
 
-    jobs: List[Tuple[str, Dict[str, Any]]] = []
+    pending: List[Tuple[str, Dict[str, Any]]] = []
 
     for doc in docs:
         data = doc.to_dict() or {}
-        logger.info("   • Doc %s => %s", doc.id, data)
+
+        # Log a trimmed JSON version so logs stay readable
+        try:
+            data_json = json.dumps(data, default=str)
+        except TypeError:
+            data_json = str(data)
+        logger.info("   • Doc %s => %s", doc.id, data_json[:600])
 
         status = data.get("status")
-        claimed = data.get("claimed")
+        claimed = data.get("claimed", False)
 
-        if status == "pending" and claimed is not True:
-            logger.info("   ✅ Doc %s matches pending+unclaimed filter", doc.id)
-            jobs.append((doc.id, data))
-            if len(jobs) >= limit:
-                break
+        if status == "pending" and not claimed:
+            logger.info("   ✅ Doc %s qualifies as pending + unclaimed", doc.id)
+            pending.append((doc.id, data))
+        else:
+            logger.info(
+                "   ↩︎ Doc %s skipped (status=%r, claimed=%r)",
+                doc.id,
+                status,
+                claimed,
+            )
 
-    logger.info("➡️ Returning %d pending job(s)", len(jobs))
-    return jobs
+    logger.info("✅ Returning %d pending job(s)", len(pending))
+    return pending[:limit]
 
 
-def get_rendering_jobs(limit: int = 20) -> List[Tuple[str, Dict[str, Any]]]:
-    logger.info("Fetching rendering jobs from Firestore...")
-    query = (
-        _jobs_collection()
-        .where("status", "==", "rendering")
-        .where("claimed", "==", True)
-        .limit(limit)
-    )
-    docs = list(query.stream())
-    logger.info("Fetched %d rendering job(s) from Firestore", len(docs))
-    return [(doc.id, doc.to_dict()) for doc in docs]
+# ---------------------------------------------------------------------------
+# Job helpers used by the worker
+# ---------------------------------------------------------------------------
+def mark_job_claimed(job_id: str) -> None:
+    """Mark a job as claimed so other workers ignore it."""
+    logger.info("Firestore mark_job_claimed(%s)", job_id)
+    _jobs_collection().document(job_id).set({"claimed": True}, merge=True)
 
 
 def update_job(job_id: str, data: Dict[str, Any]) -> None:
+    """Merge updates into a job document."""
     logger.info("Firestore update_job(%s, %s)", job_id, data)
-    _jobs_collection().document(job_id).update(data)
+    _jobs_collection().document(job_id).set(data, merge=True)
 
 
 def add_event(job_id: str, event: Dict[str, Any]) -> None:
+    """Append an event to the job's 'events' subcollection."""
     logger.info("Firestore add_event for job %s: %s", job_id, event)
-    event["created_at"] = datetime.now(timezone.utc)
-    _jobs_collection().document(job_id).collection("events").add(event)
-
-
-def mark_job_claimed(job_id: str) -> None:
-    update_job(job_id, {"claimed": True})
-
-
-def mark_job_completed(job_id: str, output_url: str, finished_at: datetime) -> None:
-    iso_finished = finished_at.astimezone(timezone.utc).isoformat()
-    update_job(
-        job_id,
+    events_ref = _jobs_collection().document(job_id).collection("events")
+    events_ref.add(
         {
-            "status": "completed",
-            "output_path": output_url,
-            "metadata.finished_at": iso_finished,
-            "metadata.output_url": output_url,
-            "metadata.status": "completed",
-        },
-    )
-    add_event(
-        job_id,
-        {
-            "type": "completed",
-            "message": f"Render completed, output_url={output_url}",
-        },
+            **event,
+            "created_at": firestore.SERVER_TIMESTAMP,
+        }
     )
