@@ -1,27 +1,32 @@
 import os
 import time
 import logging
-import requests
 from typing import Dict, Any, List, Tuple
+
+import requests
 from dotenv import load_dotenv
 
-from firebase_client import get_pending_jobs, update_job, add_event
+from firebase_client import (
+    get_pending_jobs,
+    get_rendering_jobs,
+    update_job,
+    add_event,
+)
 
-# ----------------------------------------
+# -------------------------------------------------------------------
 # ENV + LOGGING
-# ----------------------------------------
+# -------------------------------------------------------------------
 
 load_dotenv()
 
 SHOTSTACK_API_URL = os.getenv(
     "SHOTSTACK_API_URL",
-    "https://api.shotstack.io/stage/render"
+    "https://api.shotstack.io/stage/render",  # stage by default
 )
-
 SHOTSTACK_API_KEY = os.getenv("SHOTSTACK_API_KEY")
 
 if not SHOTSTACK_API_KEY:
-    raise RuntimeError("SHOTSTACK_API_KEY is not set.")
+    raise RuntimeError("SHOTSTACK_API_KEY is not set in .env")
 
 HEADERS = {
     "x-api-key": SHOTSTACK_API_KEY,
@@ -34,153 +39,353 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cre8-shotstack-worker")
 
-# ----------------------------------------
-# VALID EFFECTS
-# ----------------------------------------
-
+# Valid Shotstack effects (from the API error message)
 VALID_EFFECTS = {
-    "none", "zoomIn", "zoomOut", "slideLeft", "slideRight",
-    "slideUp", "slideDown", "zoomInSlow", "zoomOutSlow"
+    "none",
+    "zoomIn",
+    "zoomInSlow",
+    "zoomInFast",
+    "zoomOut",
+    "zoomOutSlow",
+    "zoomOutFast",
+    "slideLeft",
+    "slideLeftSlow",
+    "slideLeftFast",
+    "slideRight",
+    "slideRightSlow",
+    "slideRightFast",
+    "slideUp",
+    "slideUpSlow",
+    "slideUpFast",
+    "slideDown",
+    "slideDownSlow",
+    "slideDownFast",
 }
 
-# ----------------------------------------
-# TEMPLATE SYSTEM
-# ----------------------------------------
+# -------------------------------------------------------------------
+# TEMPLATE BUILDERS
+# -------------------------------------------------------------------
+
 
 def build_demo_title_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Simple 5-second title template.
+
+    Reads job["asset"]:
+      - text: title text
+      - style: Shotstack title style (e.g. "minimal")
+      - length: seconds (default 5)
+      - effect: one of VALID_EFFECTS (fallback to "zoomIn")
+    """
+
     asset_cfg = job.get("asset", {}) or {}
 
     text = asset_cfg.get("text", "CRE8 STUDIO TEST RENDER")
-    style = "minimal"
-    length = 5
-    effect = asset_cfg.get("effect", "zoomIn")
+    style = asset_cfg.get("style", "minimal")
+    length = float(asset_cfg.get("length", 5))
+    start = float(asset_cfg.get("start", 0))
 
-    if effect not in VALID_EFFECTS:
-        effect = "zoomIn"
+    requested_effect = asset_cfg.get("effect", "zoomIn")
+    effect = requested_effect if requested_effect in VALID_EFFECTS else "zoomIn"
 
-    return {
-        "timeline": {
-            "tracks": [
-                {
-                    "clips": [
-                        {
-                            "asset": {
-                                "type": "title",
-                                "text": text,
-                                "style": style
-                            },
-                            "start": 0,
-                            "length": length,
-                            "effect": effect
-                        }
-                    ]
-                }
-            ]
-        },
-        "output": {
-            "format": "mp4",
-            "resolution": "hd",
-            "aspectRatio": "16:9"
-        }
+    timeline = {
+        "tracks": [
+            {
+                "clips": [
+                    {
+                        "asset": {
+                            "type": "title",
+                            "text": text,
+                            "style": style,
+                        },
+                        "start": start,
+                        "length": length,
+                        "effect": effect,
+                    }
+                ]
+            }
+        ]
     }
 
+    output = {
+        "format": "mp4",
+        "resolution": "hd",
+        "aspectRatio": "16:9",
+    }
+
+    payload = {
+        "timeline": timeline,
+        "output": output,
+    }
+
+    return payload
+
+
 def build_shotstack_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Entry point to choose which template to use.
+    For now we only have 'demo-title', but this is ready
+    for future sports, movie-review, etc.
+    """
+
     template = job.get("template", "demo-title")
 
     if template == "demo-title":
         return build_demo_title_payload(job)
 
-    logger.warning("Unknown template '%s', fallback to demo-title", template)
+    # Default: fall back to demo-title so jobs never break
+    logger.warning("Unknown template '%s', using demo-title fallback", template)
     return build_demo_title_payload(job)
 
-# ----------------------------------------
-# SHOTSTACK SUBMISSION
-# ----------------------------------------
+
+# -------------------------------------------------------------------
+# SHOTSTACK CALLS
+# -------------------------------------------------------------------
+
 
 def submit_to_shotstack(payload: Dict[str, Any]) -> str:
-    logger.info("Submitting render to Shotstack...")
-    resp = requests.post(
-        SHOTSTACK_API_URL,
-        headers=HEADERS,
-        json=payload,
-        timeout=60
-    )
+    """Send render request to Shotstack and return render_id."""
 
+    url = SHOTSTACK_API_URL
+    logger.info("Submitting render to Shotstack: %s", url)
+    resp = requests.post(url, headers=HEADERS, json=payload, timeout=60)
+
+    # Log raw response for debugging
     logger.info("Shotstack response [%s]: %s", resp.status_code, resp.text)
 
     resp.raise_for_status()
 
     data = resp.json()
-    return data["response"]["id"]
+    render_id = data["response"]["id"]
+    return render_id
 
-# ----------------------------------------
-# PROCESS SINGLE JOB
-# ----------------------------------------
+
+def fetch_shotstack_status(render_id: str) -> Dict[str, Any]:
+    """
+    Ask Shotstack for the status of a render.
+    GET /render/{id}
+    """
+    # SHOTSTACK_API_URL is ".../render"
+    url = f"{SHOTSTACK_API_URL}/{render_id}"
+    logger.info("Checking Shotstack status for render_id=%s", render_id)
+
+    # For GET we don't need JSON content-type
+    headers = {
+        "x-api-key": SHOTSTACK_API_KEY,
+    }
+
+    resp = requests.get(url, headers=headers, timeout=30)
+    logger.info("Shotstack status response [%s]: %s", resp.status_code, resp.text)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# -------------------------------------------------------------------
+# JOB PROCESSING
+# -------------------------------------------------------------------
+
 
 def process_job(job_id: str, job: Dict[str, Any]) -> None:
-    logger.info("Processing job %s", job_id)
+    logger.info("Processing job %s: %s", job_id, job)
 
-    update_job(job_id, {"status": "processing"})
+    # Mark as processing
+    update_fields = {
+        "status": "processing",
+        "claimed": True,
+    }
+    logger.info("Updating job %s with %s", job_id, update_fields)
+    update_job(job_id, update_fields)
 
-    add_event(job_id, {
+    # Add event: worker picked job
+    event = {
         "type": "processing",
-        "message": "Worker picked up job"
-    })
+        "message": "Worker picked up job",
+    }
+    logger.info("Adding event for job %s: %s", job_id, event)
+    add_event(job_id, event)
 
+    # Build Shotstack payload from template
     payload = build_shotstack_payload(job)
 
     try:
         render_id = submit_to_shotstack(payload)
     except Exception as exc:
-        logger.error("Render failed: %s", exc)
+        logger.error("Error processing job %s: %s", job_id, exc)
 
-        update_job(job_id, {
+        # Put back to pending & record error for retry
+        metadata = job.get("metadata", {}) or {}
+        metadata["error"] = str(exc)
+        metadata["retry_count"] = metadata.get("retry_count", 0) + 1
+
+        update_fields = {
             "status": "pending",
-            "error": str(exc)
-        })
+            "claimed": False,
+            "metadata": metadata,
+        }
+        logger.info("Updating job %s with %s", job_id, update_fields)
+        update_job(job_id, update_fields)
 
-        add_event(job_id, {
+        error_event = {
             "type": "error",
-            "message": str(exc)
-        })
+            "message": f"Error processing job, status set to 'pending'. Error: {exc}",
+        }
+        logger.info("Adding event for job %s: %s", job_id, error_event)
+        add_event(job_id, error_event)
         return
 
-    update_job(job_id, {
+    # Success – save render_id & mark as “rendering”
+    metadata_update = job.get("metadata", {}).copy()
+    metadata_update["render_id"] = render_id
+    metadata_update["status"] = "rendering"
+
+    update_fields = {
         "status": "rendering",
-        "metadata": {
-            "render_id": render_id,
-            "status": "rendering"
-        }
-    })
+        "metadata": metadata_update,
+    }
+    logger.info("✅ Job %s submitted to Shotstack, render_id=%s", job_id, render_id)
+    update_job(job_id, update_fields)
 
-    add_event(job_id, {
+    event = {
         "type": "render_submitted",
-        "message": f"Render ID {render_id} submitted"
-    })
+        "message": f"Render submitted to Shotstack with id {render_id}",
+    }
+    logger.info("Adding event for job %s: %s", job_id, event)
+    add_event(job_id, event)
 
-    logger.info("✅ Job %s submitted successfully", job_id)
 
-# ----------------------------------------
-# MAIN LOOP (PRODUCTION SAFE)
-# ----------------------------------------
+def check_rendering_job(job_id: str, job: Dict[str, Any]) -> None:
+    """
+    For a job with status='rendering', ask Shotstack for status.
+    When DONE:
+      - save output URL into output_path + metadata.output_url
+      - set status='completed'
+      - log events
+    """
+    logger.info("Checking rendering status for job %s", job_id)
+
+    metadata = job.get("metadata") or {}
+    render_id = metadata.get("render_id")
+
+    if not render_id:
+        logger.warning("Job %s is 'rendering' but has no render_id in metadata", job_id)
+        return
+
+    try:
+        data = fetch_shotstack_status(render_id)
+    except Exception as exc:
+        logger.error("Error fetching Shotstack status for %s: %s", job_id, exc)
+        add_event(
+            job_id,
+            {
+                "type": "status_error",
+                "message": f"Error fetching render status: {exc}",
+            },
+        )
+        return
+
+    response = data.get("response", {})
+    shot_status = (response.get("status") or "").lower()
+    output_url = response.get("url")
+
+    logger.info(
+        "Shotstack status for job %s (render_id=%s): %s",
+        job_id,
+        render_id,
+        shot_status,
+    )
+
+    # queued / rendering / done / failed
+    if shot_status in {"queued", "rendering"}:
+        # Nothing to update yet
+        return
+
+    if shot_status == "done":
+        # Update metadata + top-level fields
+        metadata_update = metadata.copy()
+        metadata_update["status"] = "done"
+        if output_url:
+            metadata_update["output_url"] = output_url
+
+        update_fields = {
+            "status": "completed",
+            "output_path": output_url,
+            "metadata": metadata_update,
+        }
+        logger.info(
+            "🎉 Render DONE for job %s, saving output_url=%s", job_id, output_url
+        )
+        update_job(job_id, update_fields)
+
+        add_event(
+            job_id,
+            {
+                "type": "render_done",
+                "message": f"Render finished. Output URL: {output_url}",
+            },
+        )
+        return
+
+    if shot_status == "failed":
+        err_msg = response.get("error") or "Shotstack render failed."
+        metadata_update = metadata.copy()
+        metadata_update["status"] = "failed"
+        metadata_update["error"] = err_msg
+
+        update_fields = {
+            "status": "failed",
+            "metadata": metadata_update,
+        }
+        logger.info("❌ Render FAILED for job %s: %s", job_id, err_msg)
+        update_job(job_id, update_fields)
+
+        add_event(
+            job_id,
+            {
+                "type": "render_failed",
+                "message": err_msg,
+            },
+        )
+        return
+
+    # Unknown status – just log
+    logger.warning(
+        "Job %s has unexpected Shotstack status '%s' (raw=%s)",
+        job_id,
+        shot_status,
+        response,
+    )
+
+
+# -------------------------------------------------------------------
+# MAIN LOOP
+# -------------------------------------------------------------------
+
 
 def main() -> None:
-    logger.info("🚀 Cre8 Shotstack Worker LIVE")
+    logger.info("🚀 Starting Cre8 Firebase + Shotstack worker...")
 
     while True:
-        jobs: List[Tuple[str, Dict[str, Any]]] = get_pending_jobs(limit=5)
+        # 1) Pick new pending jobs
+        pending_jobs: List[Tuple[str, Dict[str, Any]]] = get_pending_jobs(limit=5)
+        if pending_jobs:
+            logger.info("Found %d pending job(s).", len(pending_jobs))
+            for job_id, job in pending_jobs:
+                process_job(job_id, job)
+        else:
+            logger.info("No pending jobs found.")
 
-        if not jobs:
-            logger.info("No jobs found. Sleeping 15s...")
-            time.sleep(15)
-            continue
+        # 2) Check rendering jobs and auto-save output URL when done
+        rendering_jobs: List[Tuple[str, Dict[str, Any]]] = get_rendering_jobs(limit=10)
+        if rendering_jobs:
+            logger.info("Checking %d rendering job(s).", len(rendering_jobs))
+            for job_id, job in rendering_jobs:
+                check_rendering_job(job_id, job)
+        else:
+            logger.info("No rendering jobs to check.")
 
-        logger.info("Found %d pending job(s)", len(jobs))
+        # Short pause between cycles
+        time.sleep(15)
 
-        for job_id, job in jobs:
-            process_job(job_id, job)
-
-        time.sleep(5)
 
 if __name__ == "__main__":
     main()
