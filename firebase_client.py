@@ -1,98 +1,113 @@
-import os
-import json
+# firebase_client.py
 import logging
-from typing import Dict, Any, List, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
+import os
 
 from google.cloud import firestore
-from google.oauth2 import service_account
 
-logger = logging.getLogger("cre8-firebase")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# Name of the jobs collection (default: "jobs")
+JOBS_COLLECTION = os.getenv("FIREBASE_JOBS_COLLECTION", "jobs")
 
-# -------------------------------------------------------------------
-# FIRESTORE CLIENT
-# -------------------------------------------------------------------
-
-# Option 1: JSON string in env (Koyeb)
-#   GOOGLE_APPLICATION_CREDENTIALS_JSON = contents of the service account file
-credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-
-if credentials_json:
-    info = json.loads(credentials_json)
-    creds = service_account.Credentials.from_service_account_info(info)
-    project_id = info.get("project_id")
-    db = firestore.Client(project=project_id, credentials=creds)
-    logger.info(
-        "Initialised Firestore with explicit service account JSON, project=%s",
-        project_id,
-    )
-else:
-    # Option 2: Default ADC (if you've mounted the .json file path in Koyeb)
-    db = firestore.Client()
-    logger.info("Initialised Firestore with default application credentials")
-
-JOBS_COLLECTION = "jobs"
+# Firestore client (uses GOOGLE_APPLICATION_CREDENTIALS)
+db = firestore.Client()
 
 
-# -------------------------------------------------------------------
-# HELPERS
-# -------------------------------------------------------------------
+def _jobs_collection():
+    return db.collection(JOBS_COLLECTION)
+
 
 def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
     """
-    Fetch jobs that should be picked up by the worker.
-
-    We look for:
-      status == "pending"
-      claimed == False
-    ordered by created_at.
+    Fetch jobs that are:
+      - status == "pending"
+      - claimed == False
     """
-    logger.info("Fetching up to %d pending job(s) from Firestore", limit)
+    logger.info("Fetching pending jobs from Firestore...")
 
     query = (
-        db.collection(JOBS_COLLECTION)
+        _jobs_collection()
         .where("status", "==", "pending")
         .where("claimed", "==", False)
-        .order_by("created_at")
         .limit(limit)
     )
 
     docs = list(query.stream())
-    jobs: List[Tuple[str, Dict[str, Any]]] = [(doc.id, doc.to_dict()) for doc in docs]
-
-    logger.info("Fetched %d pending job(s) from Firestore", len(jobs))
-    return jobs
+    logger.info("Fetched %d pending job(s) from Firestore", len(docs))
+    return [(doc.id, doc.to_dict()) for doc in docs]
 
 
-def get_rendering_jobs(limit: int = 10) -> List[Tuple[str, Dict[str, Any]]]:
+def get_rendering_jobs(limit: int = 20) -> List[Tuple[str, Dict[str, Any]]]:
     """
-    Fetch jobs that are currently 'rendering' at Shotstack.
-    We will poll Shotstack and, when done, save the output_url.
+    Fetch jobs that are:
+      - status == "rendering"
+      - claimed == True
+      - have metadata.render_id
     """
-    logger.info("Fetching up to %d rendering job(s) from Firestore", limit)
+    logger.info("Fetching rendering jobs from Firestore...")
 
     query = (
-        db.collection(JOBS_COLLECTION)
+        _jobs_collection()
         .where("status", "==", "rendering")
-        .order_by("created_at")
+        .where("claimed", "==", True)
         .limit(limit)
     )
 
     docs = list(query.stream())
-    jobs: List[Tuple[str, Dict[str, Any]]] = [(doc.id, doc.to_dict()) for doc in docs]
-
-    logger.info("Fetched %d rendering job(s) from Firestore", len(jobs))
-    return jobs
+    logger.info("Fetched %d rendering job(s) from Firestore", len(docs))
+    return [(doc.id, doc.to_dict()) for doc in docs]
 
 
-def update_job(job_id: str, update_fields: Dict[str, Any]) -> None:
-    logger.info("Firestore update_job(%s, %s)", job_id, update_fields)
-    db.collection(JOBS_COLLECTION).document(job_id).update(update_fields)
+def update_job(job_id: str, data: Dict[str, Any]) -> None:
+    """
+    Update a job document.
+    Supports nested fields via dot notation (e.g. "metadata.output_url").
+    """
+    logger.info("Firestore update_job(%s, %s)", job_id, data)
+    _jobs_collection().document(job_id).update(data)
 
 
 def add_event(job_id: str, event: Dict[str, Any]) -> None:
     """
-    Append a small log entry under jobs/{job_id}/events.
+    Append an event to the job's 'events' subcollection.
     """
     logger.info("Firestore add_event for job %s: %s", job_id, event)
-    db.collection(JOBS_COLLECTION).document(job_id).collection("events").add(event)
+    event["created_at"] = datetime.now(timezone.utc)
+    _jobs_collection().document(job_id).collection("events").add(event)
+
+
+def mark_job_claimed(job_id: str) -> None:
+    """
+    Mark a job as claimed by a worker.
+    """
+    update_job(job_id, {"claimed": True})
+
+
+def mark_job_completed(job_id: str, output_url: str, finished_at: datetime) -> None:
+    """
+    Called when Shotstack render finishes successfully.
+    Saves the output_url + finished time.
+    """
+    iso_finished = finished_at.astimezone(timezone.utc).isoformat()
+
+    update_job(
+        job_id,
+        {
+            "status": "completed",
+            "output_path": output_url,  # easy for frontend to read
+            "metadata.finished_at": iso_finished,
+            "metadata.output_url": output_url,
+            "metadata.status": "completed",
+        },
+    )
+
+    add_event(
+        job_id,
+        {
+            "type": "completed",
+            "message": f"Render completed, output_url={output_url}",
+        },
+    )
