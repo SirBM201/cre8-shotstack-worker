@@ -1,22 +1,54 @@
+import os
+import json
 import logging
 from typing import Dict, Any, List, Tuple
 
 from google.cloud import firestore
+from google.oauth2 import service_account
 
 logger = logging.getLogger("cre8-shotstack-worker")
 
 # -------------------------------------------------------------------
-# FIRESTORE CLIENT
+# FIRESTORE CLIENT (with explicit service-account support)
 # -------------------------------------------------------------------
 
-db = firestore.Client()
-logger.info(f"Connected to Firestore project: {db.project}")
+def init_db() -> firestore.Client:
+    """
+    Initialize Firestore using a service-account JSON stored in an
+    environment variable, with a safe fallback to ADC if it exists.
+    """
+
+    # Try a few possible env-var names so we don't depend on only one
+    sa_json = (
+        os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        or os.getenv("GOOGLE_CLOUD_SERVICE_ACCOUNT")
+        or os.getenv("FIREBASE_SERVICE_ACCOUNT")
+    )
+
+    if sa_json:
+        logger.info("Initializing Firestore from service-account JSON env var...")
+        info = json.loads(sa_json)
+        creds = service_account.Credentials.from_service_account_info(info)
+        project_id = info.get("project_id")
+        client = firestore.Client(project=project_id, credentials=creds)
+        logger.info("Connected to Firestore project (service-account): %s", client.project)
+        return client
+
+    # Fallback: try Application Default Credentials (GCP-style)
+    logger.info("No service-account JSON env var found, using default credentials...")
+    client = firestore.Client()
+    logger.info("Connected to Firestore project (ADC): %s", client.project)
+    return client
+
+
+db = init_db()
 
 JOBS_COLLECTION = "jobs"
 EVENTS_SUBCOLLECTION = "events"
 
 # -------------------------------------------------------------------
-# HELPERS
+# QUERIES
 # -------------------------------------------------------------------
 
 
@@ -25,8 +57,6 @@ def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
     Fetch jobs from the top-level 'jobs' collection where:
       - status == 'pending'
       - claimed == False
-
-    Returns: list of (job_id, job_data)
     """
 
     jobs_ref = db.collection(JOBS_COLLECTION)
@@ -48,7 +78,7 @@ def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
         data = doc.to_dict() or {}
         jobs.append((doc.id, data))
 
-        # Mark as claimed immediately so other workers don't pick it
+        # Mark as claimed so another worker can't pick it
         try:
             jobs_ref.document(doc.id).update({"claimed": True})
         except Exception as exc:
@@ -58,32 +88,15 @@ def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def update_job(job_id: str, fields: Dict[str, Any]) -> None:
-    """
-    Update a job document in the 'jobs' collection.
-    Example: update_job("test-job-001", {"status": "processing"})
-    """
-
     logger.info("Firestore update_job(%s, %s)", job_id, fields)
-
-    jobs_ref = db.collection(JOBS_COLLECTION).document(job_id)
-    jobs_ref.update(fields)
+    db.collection(JOBS_COLLECTION).document(job_id).update(fields)
 
 
 def add_event(job_id: str, event: Dict[str, Any]) -> None:
-    """
-    Add an event document under:
-      jobs/{job_id}/events/{auto_id}
-    """
-
     logger.info("Firestore add_event for job %s: %s", job_id, event)
-
-    events_ref = (
+    (
         db.collection(JOBS_COLLECTION)
         .document(job_id)
         .collection(EVENTS_SUBCOLLECTION)
+        .add({**event, "created_at": firestore.SERVER_TIMESTAMP})
     )
-
-    events_ref.add({
-        **event,
-        "created_at": firestore.SERVER_TIMESTAMP,
-    })
