@@ -5,39 +5,42 @@ from typing import Any, Dict, List, Tuple
 
 from google.cloud import firestore
 
+# Simple logging setup
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Use env var if provided, otherwise "jobs"
+# ---------------------------------------------------------------------------
+# Firestore setup
+# ---------------------------------------------------------------------------
+
+# Use env var for collection name if provided, otherwise "jobs"
 JOBS_COLLECTION = os.getenv("FIREBASE_JOBS_COLLECTION", "jobs")
-logger.info("Firestore jobs collection set to: %s", JOBS_COLLECTION)
 
 # Firestore client (uses GOOGLE_APPLICATION_CREDENTIALS)
 db = firestore.Client()
 
-
-def _jobs_collection():
-    """Return the Firestore collection where jobs are stored."""
-    return db.collection(JOBS_COLLECTION)
-
+# Keep this global so any existing imports from main.py still work
+jobs_collection = db.collection(JOBS_COLLECTION)
+logger.info("Firestore jobs collection set to: %s", JOBS_COLLECTION)
 
 # ---------------------------------------------------------------------------
 # Pending jobs
 # ---------------------------------------------------------------------------
+
 def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
     """
     Fetch pending, unclaimed jobs from Firestore.
 
-    We deliberately:
-      - Scan ALL documents in the collection
+    To keep things simple (and avoid index issues), we:
+      - Stream ALL documents in the jobs collection
       - Log each document's data
       - Filter in Python for:
             status == "pending"
             claimed is missing or False
-    so we don't rely on Firestore query indexes while debugging.
     """
-    logger.info("🔍 Scanning Firestore jobs collection '%s' for pending jobs...", JOBS_COLLECTION)
+    logger.info("🔍 Scanning Firestore collection '%s' for pending jobs...", JOBS_COLLECTION)
 
-    docs = list(_jobs_collection().stream())
+    docs = list(jobs_collection.stream())
     logger.info("🔍 Found %d document(s) total in '%s'", len(docs), JOBS_COLLECTION)
 
     pending: List[Tuple[str, Dict[str, Any]]] = []
@@ -73,22 +76,23 @@ def get_pending_jobs(limit: int = 5) -> List[Tuple[str, Dict[str, Any]]]:
 # ---------------------------------------------------------------------------
 # Job helpers used by the worker
 # ---------------------------------------------------------------------------
-def mark_job_claimed(job_id: str) -> None:
+
+def claim_job(job_id: str) -> None:
     """Mark a job as claimed so other workers ignore it."""
-    logger.info("Firestore mark_job_claimed(%s)", job_id)
-    _jobs_collection().document(job_id).set({"claimed": True}, merge=True)
+    logger.info("Firestore claim_job(%s)", job_id)
+    jobs_collection.document(job_id).set({"claimed": True}, merge=True)
 
 
 def update_job(job_id: str, data: Dict[str, Any]) -> None:
     """Merge updates into a job document."""
     logger.info("Firestore update_job(%s, %s)", job_id, data)
-    _jobs_collection().document(job_id).set(data, merge=True)
+    jobs_collection.document(job_id).set(data, merge=True)
 
 
 def add_event(job_id: str, event: Dict[str, Any]) -> None:
     """Append an event to the job's 'events' subcollection."""
     logger.info("Firestore add_event for job %s: %s", job_id, event)
-    events_ref = _jobs_collection().document(job_id).collection("events")
+    events_ref = jobs_collection.document(job_id).collection("events")
     events_ref.add(
         {
             **event,
